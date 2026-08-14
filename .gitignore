@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Secrets / local config (NEVER commit)
+.env
+google_token.json
+
+# Local output artifacts
+*.html
+*.png
