@@ -16,7 +16,7 @@ Pipeline:
   7. For approved pairs: INLINE INSERT via LLM paragraph rewrite:
        a. Split source post content into paragraphs
        b. Embed paragraphs, score against target article embedding
-       c. Send top-5 most similar paragraphs + target info to LLM
+       c. Send top-3 most similar paragraphs + target info to LLM
        d. LLM returns: paragraph_index + replacement text + confidence + preserved links
        e. String-replace that one paragraph in the raw content
        f. Backup original to v3_backups tab, then PUT to WordPress
@@ -39,9 +39,11 @@ Requires in .env:
 """
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
+import sqlite3
 import sys
 import time
 from html.parser import HTMLParser
@@ -169,11 +171,93 @@ def post_slug_from_url(url):
 # ---------------------------------------------------------------- LLM helpers
 LLM_MODEL = "deepseek-v4-flash"
 LLM_BASE = "https://api.deepseek.com/chat/completions"
+LLM_CACHE_PATH = "/opt/data/scripts/.llm_cache.sqlite"
+LLM_CACHE_FALLBACK = ".llm_cache.sqlite"
+
+
+def _llm_cache_connect():
+    schema = """
+        CREATE TABLE IF NOT EXISTS llm_cache (
+            cache_key TEXT PRIMARY KEY,
+            model TEXT NOT NULL,
+            prompt_hash TEXT NOT NULL,
+            response_text TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            hit_count INTEGER NOT NULL DEFAULT 1,
+            last_accessed_at TEXT NOT NULL
+        )
+    """
+    for path in (LLM_CACHE_PATH, LLM_CACHE_FALLBACK):
+        conn = None
+        try:
+            conn = sqlite3.connect(path, timeout=30)
+            conn.execute("PRAGMA busy_timeout = 30000")
+            conn.execute(schema)
+            conn.commit()
+            return conn
+        except (OSError, sqlite3.Error):
+            if conn is not None:
+                conn.close()
+    raise RuntimeError("Unable to open the LLM cache database")
+
+
+def _llm_cache_key(prompt):
+    prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    cache_key = hashlib.sha256(f"{LLM_MODEL}:{prompt}".encode("utf-8")).hexdigest()
+    return cache_key, prompt_hash
+
+
+def _llm_cache_get(cache_key):
+    conn = None
+    try:
+        conn = _llm_cache_connect()
+        row = conn.execute(
+            "SELECT response_text FROM llm_cache WHERE cache_key = ?",
+            (cache_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        conn.execute(
+            "UPDATE llm_cache "
+            "SET hit_count = hit_count + 1, last_accessed_at = ? "
+            "WHERE cache_key = ?",
+            (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), cache_key),
+        )
+        conn.commit()
+        return row[0]
+    except (OSError, sqlite3.Error, RuntimeError):
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _llm_cache_put(cache_key, prompt_hash, response_text):
+    conn = None
+    try:
+        conn = _llm_cache_connect()
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        conn.execute(
+            "INSERT OR IGNORE INTO llm_cache "
+            "(cache_key, model, prompt_hash, response_text, created_at, last_accessed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (cache_key, LLM_MODEL, prompt_hash, response_text, now, now),
+        )
+        conn.commit()
+    except (OSError, sqlite3.Error, RuntimeError):
+        pass
+    finally:
+        if conn is not None:
+            conn.close()
 
 def _llm(prompt, max_tokens=500, temperature=0.4, retries=2):
     """deepseek-v4-flash is a reasoning model — it burns tokens on
     reasoning_content first, so max_tokens must cover reasoning + answer.
     On empty content, retry with a bigger budget."""
+    cache_key, prompt_hash = _llm_cache_key(prompt)
+    cached = _llm_cache_get(cache_key)
+    if cached is not None:
+        return cached
     key = os.environ.get("DEEPSEEK_API_KEY")
     if not key:
         raise RuntimeError("DEEPSEEK_API_KEY not set")
@@ -188,6 +272,8 @@ def _llm(prompt, max_tokens=500, temperature=0.4, retries=2):
     if not content and retries > 0:
         # reasoning model ate the budget — retry with 3x tokens
         return _llm(prompt, max_tokens=max_tokens * 3, temperature=temperature, retries=retries - 1)
+    if content:
+        _llm_cache_put(cache_key, prompt_hash, content)
     return content
 
 def generate_anchor(src_title, src_text, tgt_title, tgt_text):
@@ -251,6 +337,7 @@ def inline_rewrite(src_title, paragraphs, tgt_title, tgt_url, anchor):
     """LLM picks ONE paragraph to rewrite with the inline link.
     Returns (index, replacement_text, confidence) or (None, None, 0) if no fit."""
     tgt_norm = normalize_url(tgt_url)
+    paragraphs = paragraphs[:3]
     paras_txt = "\n\n".join(f"[{i}] {p['text']}" for i, p in enumerate(paragraphs))
     prompt = (
         "You are an editor for an Indonesian WordPress blog.\n"
@@ -729,7 +816,7 @@ def main():
                 new_html = None
                 old_html = None
                 if paras:
-                    top = sorted(range(len(paras)), key=lambda k: -para_sim[k])[:5]
+                    top = sorted(range(len(paras)), key=lambda k: -para_sim[k])[:3]
                     # guard paragraph length 50-500 chars
                     top = [k for k in top if 50 <= len(paras[k]["text"]) <= 500]
                     # NEVER rewrite a paragraph that already contains an internal
