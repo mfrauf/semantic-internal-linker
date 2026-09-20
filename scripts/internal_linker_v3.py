@@ -169,8 +169,8 @@ def post_slug_from_url(url):
     return slug if slug and "." not in slug.split("/")[-1] else ""
 
 # ---------------------------------------------------------------- LLM helpers
-LLM_MODEL = "deepseek-v4-flash"
-LLM_BASE = "https://api.deepseek.com/chat/completions"
+LLM_MODEL = "deepseek/deepseek-v4-flash"
+LLM_BASE = "http://127.0.0.1:8789/compat/vikey/chat/completions"
 LLM_CACHE_PATH = "/opt/data/scripts/.llm_cache.sqlite"
 LLM_CACHE_FALLBACK = ".llm_cache.sqlite"
 
@@ -258,9 +258,9 @@ def _llm(prompt, max_tokens=500, temperature=0.4, retries=2):
     cached = _llm_cache_get(cache_key)
     if cached is not None:
         return cached
-    key = os.environ.get("DEEPSEEK_API_KEY")
+    key = os.environ.get("HERMES_CUSTOM_API_VIKEY_AI_API_KEY") or os.environ.get("VIKEY_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")
     if not key:
-        raise RuntimeError("DEEPSEEK_API_KEY not set")
+        raise RuntimeError("VIKEY_API_KEY / HERMES_CUSTOM_API_VIKEY_AI_API_KEY / DEEPSEEK_API_KEY not set")
     body = {"model": LLM_MODEL, "messages": [{"role": "user", "content": prompt}],
             "temperature": temperature, "max_tokens": max_tokens}
     req = request.Request(LLM_BASE, data=json.dumps(body).encode(),
